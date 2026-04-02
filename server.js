@@ -74,7 +74,114 @@ const transactionSchema = new mongoose.Schema({
 
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
+// OTP Model
+const otpSchema = new mongoose.Schema({
+    phone: { type: String, required: true },
+    otp: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now, index: { expires: 300 } } // Expires in 5 minutes
+});
+
+const OTP = mongoose.model('OTP', otpSchema);
+
+// In-memory fallback for OTPs (to avoid Mongoose timeouts if DB is not running)
+const mockOTPStore = new Map();
+
+// UTILS
+const sendSMS = async (phone, otp) => {
+    // Real implementation for Fast2SMS (Option 2)
+    // In a real hackathon, you'd get an API key from Fast2SMS
+    const API_KEY = process.env.FAST2SMS_API_KEY;
+    
+    if (!API_KEY) {
+        console.log(`[MOCK SMS] To: ${phone}, Message: Your OTP is ${otp}. Please set FAST2SMS_API_KEY in .env for real SMS.`);
+        return true;
+    }
+
+    try {
+        const response = await fetch("https://www.fast2sms.com/dev/bulkV2", {
+            method: 'POST',
+            headers: {
+                "authorization": API_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                "route": "otp",
+                "variables_values": otp,
+                "numbers": phone
+            })
+        });
+        const data = await response.json();
+        return data.return === true;
+    } catch (error) {
+        console.error("SMS Sending Error:", error);
+        return false;
+    }
+};
+
 // ROUTES
+
+// Send OTP
+app.post('/api/auth/send-otp', async (req, res) => {
+    try {
+        const { phone } = req.body;
+        if (!phone) return res.status(400).json({ error: "Phone number is required" });
+
+        // Generate 6-digit OTP
+        const otpValue = Math.floor(100000 + Math.random() * 900000).toString();
+
+        // 1. Try DB (but don't wait for it if it's stuck)
+        try {
+           await OTP.findOneAndUpdate(
+               { phone },
+               { otp: otpValue, createdAt: Date.now() },
+               { upsert: true, maxTimeMS: 500 } // Fast fail if DB buffering
+           );
+        } catch (dbError) {
+           console.log("DB buffering or unavailable. Using in-memory fallback for demo.");
+        }
+
+        // 2. Always store in-memory for the demo to ensure it works
+        mockOTPStore.set(phone, { otp: otpValue, expires: Date.now() + 300000 });
+
+        // Send SMS (Mock or Real)
+        await sendSMS(phone, otpValue);
+        
+        // Return OTP in response for Demo Mode (as requested)
+        res.json({ 
+            success: true, 
+            message: "OTP sent successfully", 
+            demoOtp: otpValue // ONLY FOR HACKATHON DEMO
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Verify OTP
+app.post('/api/auth/verify-otp', async (req, res) => {
+    try {
+        const { phone, otp } = req.body;
+        if (!phone || !otp) return res.status(400).json({ error: "Phone and OTP are required" });
+
+        // Check in-memory Store first (reliable for demo)
+        const inMemoryRecord = mockOTPStore.get(phone);
+        if (inMemoryRecord && inMemoryRecord.otp === otp && inMemoryRecord.expires > Date.now()) {
+            mockOTPStore.delete(phone);
+            return res.json({ success: true, message: "OTP verified correctly (Memory)" });
+        }
+
+        // Fallback to DB
+        const record = await OTP.findOne({ phone, otp });
+        if (record) {
+            await OTP.deleteOne({ _id: record._id });
+            return res.json({ success: true, message: "OTP verified correctly (DB)" });
+        }
+
+        res.status(400).json({ success: false, error: "Invalid or expired OTP" });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 // User Registration
 app.post('/api/users/register', async (req, res) => {
